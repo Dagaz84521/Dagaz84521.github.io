@@ -7,7 +7,7 @@ categories:
 description: 根据LearnOpenGL还有浅墨翻译的RTR4实现的ShadowMapping
 ---
 
-# 一、ShadowMapping
+# ShadowMapping
 
 > 1978年，Williams [1888]提出了一种通用的、基于z-buffer的渲染器，它可以在任意物体上快速生成阴影。其核心想法是从光源的位置出发，使用z-buffer来渲染整个场景，然后再生成阴影效果。能够被光源“看见”的任何物体都会被照亮，光源“看不见”的物体则都处于阴影中。实际上在图像渲染的时候，我们最终只需要这个z-buffer即可，即我们只需要场景的深度信息；因此在这个特殊的场景渲染中，我们可以关闭光照、纹理等选项，也不用向颜色缓冲写入任何值。
 >
@@ -39,7 +39,7 @@ OK，假如我们在光源向光线方向看，能看到点B，但看不到点A�
 
 接下来的
 
-# 二、定向光阴影贴图
+# 定向光阴影贴图
 
 如何获得这个阴影贴图呢？就是将摄像头放在光源位置，进行一次场景渲染，只不过这个场景我们不需要其颜色信息，只需要知道其深度信息。
 
@@ -61,4 +61,314 @@ OK，假如我们在光源向光线方向看，能看到点B，但看不到点A�
 
 这里再复习一下帧缓冲是怎么使用的。
 
-首先，我们绘制在屏幕上的内容实际上用的是默认帧缓冲，一共有两块。当一块绘制完了通过`glfwSwapBuffers(window);`
+首先，我们绘制在屏幕上的内容实际上用的是默认帧缓冲，一共有两块。当一块绘制完了通过`glfwSwapBuffers(window);`交换到显示的，然后再对换下来的进行绘制。
+
+除此之外，我们也可以自己定义一些帧缓冲，来实现对他们的渲染，然后利用这些帧缓冲实现一些效果。我们自己定义的帧缓冲需要满足以下条件：
+
+- 附加至少一个缓冲（颜色、深度或模板缓冲）。
+- 至少有一个颜色附件(Attachment)。
+- 所有的附件都必须是完整的（保留了内存）。
+- 每个缓冲都应该有相同的样本数(sample)。
+
+接下来，我们就需要一个帧缓冲，用于记录光源观察空间的深度信息，并且将结果存在一个纹理图像中，这个纹理图像就是shadow map.
+
+```C++
+//创建一个分辨率为1024 * 1024的2D纹理，提供给帧缓冲使用
+const unsigned int SHADOW_WIDTH = 1024, SHADOW_HEIGHT=1024;
+unsigned int depthMap;
+glGenTextures(1, &depthMap);
+glBindTexture(GL_TEXTURE_2D, depthMap);
+glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT, 
+             SHADOW_WIDTH, SHADOW_HEIGHT, 0, GL_DEPTH_COMPONENT, GL_FLOAT, NULL);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT); 
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+
+//创建一个帧缓冲对象，并将生成的深度纹理作为帧缓冲的深度缓冲
+unsigned int depthMapFBO;
+glGenFrameBuffers(1, &depthMapFBO);
+glBindFrameBuffer(GL_FRAMEBUFFER, depthMapFBO);
+//将depthMap这个纹理图像作为帧缓冲的深度附件，也就是深度就会绘制到这个2D纹理上。
+glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, depthMap, 0);
+//因为只需要用到深度，无需颜色，所以需要显式地告诉OpenGL不使用颜色进行渲染。所以要将读写都设置成GL_NONE来完成这件事
+glDrawBuffer(GL_NONE);
+glReadBuffer(GL_NONE);
+glBindFramebuffer(GL_FRAMEBUFFER, 0);
+```
+
+## 绘制阴影贴图
+
+OK，经过上面的步骤，我们已经实现了阴影贴图和一个帧缓冲用于绘制这个阴影贴图了。
+
+那么接下来，我们就要在我们的主渲染循环中完成阴影贴图的绘制了。
+
+首先，我们需要两个着色器，一个是用于绘制阴影贴图的，另一个则是用于显示这张阴影贴图的。
+
+这里我用`simpleDepthShader`这个着色器来实现绘制阴影贴图，使用`DebugDepthQuad`来将这个阴影贴图可视化。
+
+首先，我们要通过`simpleDepthShader`绘制阴影贴图
+
+首先是顶点着色器，通过我们之前在二.1中推出的`lightProjection` 和`lightView`就能得到光源空间的变化矩阵`lightSpaceMatrix`。
+
+然后就能计算出光源空间的顶点位置。
+
+```glsl
+#version 330 core
+
+layout(location = 0) in vec3 position;
+
+uniform mat4 lightSpaceMatrix; // lightSpaceMatrix = lightProjection * lightView
+uniform mat4 model;
+
+void main()
+{
+    gl_Position = lightSpaceMatrix * model * vec4(position, 1.0);
+}
+```
+
+而在后面片段着色器中，由于我们前面已经将depthMap作为深度附件了，所以直接设置成空就行了，深度测试的时候就会自动将深度值记录在depthMap中了。
+
+所以在while循环中，我们需要的就是传入通过`lightProjection` 和`lightView`得到的`lightSpaceMatrix`。
+
+还有一个点需要注意的是，要把帧缓冲换成`depthMapFBO`，而不是默认帧缓冲，同时还要记得修改视口至我们设置的纹理分辨率：
+
+```C++
+float near_plane = 1.0f, far_plane = 7.5f;
+//定向光采用正交投影
+glm::mat4 lightProjection = glm::ortho(-10.0f, 10.0f, -10.0f, 10.0f, near_plane, far_plane); 
+//lookAt函数的三个参数分别是 摄像机位置、摄像机观察的位置和世界空间的上方向。
+glm::mat4 lightView = glm::lookAt(lightPos, glm::vec3(0.0f), glm::vec3(0.0, 1.0, 0.0));
+glm::mat4 lightSpaceMatrix = lightProjection * lightView;
+simpleDepthShader.use();
+simpleDepthShader.setMat4("lightSpaceMatrix", lightSpaceMatrix);
+//修改视口至我们设置的纹理分辨率
+glViewport(0, 0, SHADOW_WIDTH, SHADOW_HEIGHT);
+//把缓冲换成depthMapFBO
+glBindFramebuffer(GL_FRAMEBUFFER, depthMapFBO);
+glClear(GL_DEPTH_BUFFER_BIT);
+//绘制整个场景，Model矩阵在这里设置
+renderScene(simpleDepthShader);
+```
+
+这个时候depthMap就是我们在光照空间的深度信息了。
+
+我们接下来可以先用一个debug的shader，来看看我们的结果：
+
+```glsl
+// 顶点着色器
+#version 330 core
+layout(location = 0) in vec3 position;
+layout(location = 1) in vec2 texCoords;
+
+out vec2 TexCoords;
+
+void main()
+{
+    gl_Position = vec4(position, 1.0);
+    // Pass the texture coordinates to the fragment shader
+    TexCoords = texCoords;
+}
+
+// 片段着色器
+#version 330 core
+in vec2 TexCoords;
+
+uniform sampler2D depthMap;
+uniform float near_plane;
+uniform float far_plane;
+
+out vec4 FragColor;
+
+// 这个函数是使用透视投影需要使用的
+float LinearizeDepth(float depth)
+{
+    float z = depth * 2.0 - 1.0; // Back to NDC 
+    return (2.0 * near_plane * far_plane) / (far_plane + near_plane - z * (far_plane - near_plane));	
+}
+
+void main()
+{
+    float depth = texture(depthMap, TexCoords).r;
+    // Convert depth to a color value for visualization
+    FragColor = vec4(vec3(depth), 1.0);
+}
+```
+
+注意在循环中切换视口和默认帧缓冲：
+
+```C++
+glBindFramebuffer(GL_FRAMEBUFFER, 0);
+glViewport(0, 0, SCR_WIDTH, SCR_HEIGHT);
+glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+// 将深度贴图绑定到默认帧缓冲
+DebugDepthQuad.use();
+glActiveTexture(GL_TEXTURE0);
+glBindTexture(GL_TEXTURE_2D, depthMap);
+renderQuad();
+```
+
+这样，我们就能看到阴影贴图了：
+
+![image-20250528223128871](https://cdn.jsdelivr.net/gh/Dagaz84521/DagazBlogPicture@main/img/20250528223128933.png)
+
+## 渲染阴影
+
+接下来，我们就需要一个新的shader来绘制整个场景，并判断是否绘制阴影了。
+
+这里是顶点着色器，没什么需要更多补充的内容，就是正常渲染的mvp矩阵。
+
+```glsl
+#version 330 core
+layout (location = 0) in vec3 aPos;
+layout (location = 1) in vec3 aNormal;
+layout (location = 2) in vec2 aTexCoords;
+
+out VS_OUT{
+    vec3 FragPos;
+    vec3 Normal;
+    vec2 TexCoords;
+    vec4 FragPosLightSpace; //在光源空间中片段位置
+} vs_out;
+
+uniform mat4 projection;
+uniform mat4 view;
+uniform mat4 model;
+uniform mat4 lightSpaceMatrix;
+
+void main()
+{
+    gl_Position = projection * view * model * vec4(aPos, 1.0);
+    vs_out.FragPos = vec3(model * vec4(aPos, 1.0));
+    vs_out.Normal = mat3(transpose(inverse(model))) * aNormal; // Correct normal transformation
+    vs_out.TexCoords = aTexCoords;
+    vs_out.FragPosLightSpace = lightSpaceMatrix * vec4(vs_out.FragPos, 1.0);
+}
+```
+
+然后就是重头戏，片段着色器了。
+
+首先是正常的一个渲染，采用的是Blinn-Phong光照模型：
+
+```glsl
+#version 330 core
+in VS_OUT{
+    vec3 FragPos;
+    vec3 Normal;
+    vec2 TexCoords;
+    vec4 FragPosLightSpace;
+} fs_in;
+out vec4 FragColor;
+uniform sampler2D diffuseTexture;
+uniform sampler2D shadowMap;
+
+uniform vec3 lightPos;
+uniform vec3 viewPos;
+
+float ShadowCalculation(vec4 fragPosLightSpace)
+{
+    [...]
+}
+
+void main()
+{
+    vec3 color = texture(diffuseTexture, fs_in.TexCoords).rgb;
+    vec3 normal = normalize(fs_in.Normal);
+    vec3 lightColor = vec3(1.0);
+    // Ambient
+    vec3 ambient = 0.15 * color;
+    // Diffuse
+    vec3 lightDir = normalize(lightPos - fs_in.FragPos);
+    float diff = max(dot(lightDir, normal), 0.0);
+    vec3 diffuse = diff * lightColor;
+    // Specular
+    vec3 viewDir = normalize(viewPos - fs_in.FragPos);
+    vec3 reflectDir = reflect(-lightDir, normal);
+    float spec = 0.0;
+    vec3 halfwayDir = normalize(lightDir + viewDir);  
+    spec = pow(max(dot(normal, halfwayDir), 0.0), 64.0);
+    vec3 specular = spec * lightColor;    
+    // 计算阴影
+    float shadow = ShadowCalculation(fs_in.FragPosLightSpace, normal, lightDir);       
+    vec3 lighting = (ambient + (1.0 - shadow) * (diffuse + specular)) * color;    
+
+    FragColor = vec4(lighting, 1.0f);
+}
+```
+
+其中有一个函数`ShadowCalculation`，主要是用来计算是否存在阴影的，存在则返回1.0，否则返回0.0：
+
+```glsl
+float ShadowCalculation(vec4 fragPosLightSpace)
+{
+    //1.执行透视除法
+    vec3 projCoords = fragPosLightSpace.xyz / fragPosLightSpace.w;
+    //2.变换到[0,1]的范围
+    projCoords = projCoords * 0.5 + 0.5;
+    //3.取得最近点的深度(使用[0,1]范围下的fragPosLight当坐标)
+    float closestDepth = texture(shadowMap, projCoords.xy).r; 
+    //4.取得当前片段在光源视角下的深度
+    float currentDepth = projCoords.z;
+    //5.检查当前片段是否在阴影中
+    float shadow = currentDepth  > closestDepth  ? 1.0 : 0.0;
+    return shadow;
+}
+```
+
+我们一行一行解释：
+
+1. 当我们在顶点着色器输出一个裁切空间顶点位置到`gl_Position`时，OpenGL自动进行一个透视除法，将裁切空间坐标的范围-w到w转为-1到1，这要将x、y、z元素除以向量的w元素来实现。也就是说，在深度贴图中，我们传入的`gl_Position`是经过透视除法的，但是我们自己从顶点着色器传入的`FragPosLightSpace`并未进行这一操作，所以需要先进行这一步，保证其z值是在[-1,1]的。
+2. 上面的`projCoords`的xyz分量都是[-1,1]（下面会指出这对于远平面之类的点才成立），而为了和深度贴图的深度相比较，z分量需要变换到[0,1]；为了作为从深度贴图中采样的坐标，xy分量也需要变换到[0,1]。所以整个`projCoords`向量都需要变换到[0,1]范围。
+3. `shadowMap`存储的就是深度，所以直接通过texture就可以获得。
+4. `projCoords`就是当前片段在光源观察空间的位置，所以直接获取其z值就行。
+5. 如果`currentDepth  > closestDepth`说明看不见，所以返回1.0，否则返回0.0。（由于精度的问题，不要使用==）
+
+完成了这个，就需要修改一下渲染循环了：
+
+```C++
+glViewport(0, 0, SCR_WIDTH, SCR_HEIGHT);
+glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+ShadowMapping.use();
+ShadowMapping.setMat4("lightSpaceMatrix", lightSpaceMatrix);
+ShadowMapping.setVec3("lightPos", lightPos);
+ShadowMapping.setVec3("viewPos", camera.Position);
+ShadowMapping.setInt("diffuseTexture", 0);
+ShadowMapping.setInt("shadowMap", 1);
+
+glm::mat4 projection = glm::perspective(glm::radians(camera.Zoom), (float)SCR_WIDTH / (float)SCR_HEIGHT, 0.1f, 100.0f);
+glm::mat4 view = camera.GetViewMatrix();
+ShadowMapping.setMat4("projection", projection);
+ShadowMapping.setMat4("view", view);
+glActiveTexture(GL_TEXTURE0);
+glBindTexture(GL_TEXTURE_2D, woodTexture);
+glActiveTexture(GL_TEXTURE1);
+glBindTexture(GL_TEXTURE_2D, depthMap);
+renderScene(ShadowMapping);
+```
+
+所以就能实现一个大概的效果：
+
+<center>
+    <img src = "https://cdn.jsdelivr.net/gh/Dagaz84521/DagazBlogPicture@main/img/20250528225513991.png"/>
+</center>
+
+可以看到，效果非常好。（好在哪，我请问了）
+
+现在我们的画面已经显现了阴影了，但是还是存在很多问题，其中最令人瞩目的还是这个自阴影，也就是画面中的条纹。
+
+还有一些问题，比如说这个凭空出现的阴影：
+
+<center>
+    <img src="https://cdn.jsdelivr.net/gh/Dagaz84521/DagazBlogPicture@main/img/20250528225828663.png" />
+</center>
+
+还有分明的明暗分界：
+
+<center>
+    <img src="https://cdn.jsdelivr.net/gh/Dagaz84521/DagazBlogPicture@main/img/20250528225922492.png" />
+</center>
+
+我们接下来的任务就是优化这些问题。
+
+## 阴影的优化
