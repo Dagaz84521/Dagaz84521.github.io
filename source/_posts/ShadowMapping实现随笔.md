@@ -1,7 +1,7 @@
 ---
 title: ShadowMapping实现随笔
 date: 2025-05-27 18:55:39
-tags: [OpenGL, ShadowMapping]
+tags: [OpenGL, ShadowMapping, 帧缓冲, 立方体贴图]
 categories: 
 - [计算机图形学, 图形学实践]
 description: 根据LearnOpenGL还有浅墨翻译的RTR4实现的ShadowMapping
@@ -461,10 +461,69 @@ float ShadowCalculation(vec4 fragPosLightSpace, vec3 normal, vec3 lightDir)
 
 接下来要做的就是如何将这个阴影变得柔和。
 
-## 使用模型
+有点类似于MSAA？就是在阴影周围多采样几个点，然后取一个平均值。
 
-这里一开始犯了一个很严重的错误，我将模型的加载放到了渲染循环里，导致了每次渲染都需要加载模型，fps直接下降到0.36.太bt了。
+通过这种方法能让阴影边界有一种渐变的感觉，也就是周边的阴影值不再是1.0，而是一个处于0.0~1.0之间的浮点数：
 
-还有一个可以进行优化的地方，应该可以通过实例化。
+```glsl
+float shadow = 0.0;
+vec2 texelSize = 1.0 / textureSize(shadowMap, 0);
+for(int x = -1; x <= 1; ++x)
+{
+    for(int y = -1; y <= 1; ++y)
+    {
+        float pcfDepth = texture(shadowMap, projCoords.xy + vec2(x, y) * texelSize).r; 
+        shadow += currentDepth - bias > pcfDepth  ? 1.0 : 0.0;        
+    }    
+}
+shadow /= 9.0;
+```
 
-一点一点来吧，我们先来看看将model放到全局的一个效果。
+进行一个3×3范围的一个超采样后，取平均值：
+![image-20250604135403747](https://cdn.jsdelivr.net/gh/Dagaz84521/DagazBlogPicture@main/img/20250604135410966.png)
+
+从远处看，确实有好一些，但是从近处看，似乎还是不那么美丽：
+
+![image-20250604135538547](https://cdn.jsdelivr.net/gh/Dagaz84521/DagazBlogPicture@main/img/20250604135538769.png)
+
+所以我又去查看了一下RTR4阴影那一节的部分，其中也讲到了PCF，也整理了一些前人得到的经验。也提出了更多更深一步的技术，但是，定向光的阴影贴图就先做到这，后面等RTR4整理到这一章后，我们再来实现后面的技术。这一部分的内容预期将会更新在附录的部分。
+
+# 点光源阴影贴图
+
+点光源和定向光还是有所不同的。
+
+首先就是投影方式不同，对于点光源来说，其光线照在一个平面上的方式应该更像我们眼睛看事物，也就是使用了透视投影。
+
+此外还有一个问题就是，点光源的方向是朝着四面八方的，不像定向光，有一个明确的前后。这就需要使用一个立方体贴图来存储这部分的信息了。
+
+![img](https://learnopengl-cn.github.io/img/05/03/02/point_shadows_diagram.png)
+
+所以我们要做的第一件事，就很简单咯，我们先需要创建一个立方体贴图，供我们的帧缓冲存储深度信息。
+
+## 立方体贴图的创建
+
+```C++
+unsigned int depthCubemap;
+glGenTextures(1, &depthCubemap);
+
+const unsigned int SHADOW_WIDTH = 1024, SHADOW_HEIGHT = 1024;
+glBindTexture(GL_TEXTURE_CUBE_MAP, depthCubemap);
+
+//设置六个面的阴影贴图
+for (unsigned int i = 0; i < 6; ++i)
+    glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + i, 0, GL_DEPTH_COMPONENT, SHADOW_WIDTH, SHADOW_HEIGHT, 0, GL_DEPTH_COMPONENT, GL_FLOAT, NULL);
+
+//纹理参数
+glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+```
+
+在正常情况下，需要立方体贴图纹理的一个面附加到帧缓冲对象上，渲染场景6次，每次将帧缓冲的深度缓冲目标改成不同立方体贴图面。但是通过几何着色器，我们就可以实现所有面在一个过程渲染。所以可以直接绑定这个立方体贴图`depthCubeMap`到我们的`depthMapFBO`帧缓冲上。
+
+
+
+# 附录
+
