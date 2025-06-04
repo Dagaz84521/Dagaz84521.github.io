@@ -372,3 +372,99 @@ renderScene(ShadowMapping);
 我们接下来的任务就是优化这些问题。
 
 ## 阴影的优化
+
+### **阴影失真**
+
+要解决问题，首先要知道为什么会产生这个问题。
+
+这种**阴影失真**产生的原因是由于我们的shadow map并非连续的。
+
+每个像素中存储了深度值，但是显示在我们屏幕上的多个相近fragment，可能同时使用阴影贴图中的同一个像素。
+
+这些fragment计算出来的深度可能小于阴影贴图的采样值，也有可能大于。这就导致了阴影失真的发生：
+
+![img](https://picx.zhimg.com/v2-7c4be5cc0842d46d6ba0a817ff157785_1440w.jpg)
+
+图中abcd都使用了中间点的深度，cd显然更远。所以cd产生了阴影。
+
+解决办法也很简单，只需要将这个cd两点的深度值减去一个bias就行了。
+
+这个bias可以很小，0.005就能有不错的效果了。
+
+但是有些表面坡度很大，仍然会产生阴影失真。有一个更加可靠的办法能够根据表面朝向光线的角度更改偏移量：使用点乘：
+
+```glsl
+float bias = max(0.05 * (1.0 - dot(normal, lightDir)), 0.005);
+float shadow = currentDepth - bias  > closestDepth  ? 1.0 : 0.0;
+```
+
+增加了这个之后，失真立马就没了：
+
+![image-20250529211132023](https://cdn.jsdelivr.net/gh/Dagaz84521/DagazBlogPicture@main/img/20250529211139240.png)
+
+但是这个明暗分界还是在，而且还是会凭空产生阴影。
+
+### 贴图环绕方式
+
+凭空产生阴影，这个阴影其实和我们所想要的阴影是相同形状的。所以产生的原因也很简单，因为我们设置的超出深度贴图的方式是repeat的：
+
+```C++
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT); 
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+```
+
+所以我们需要做的是就是超出了这个范围都修改成没有阴影就行了：
+
+```C++
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_BORDER);
+float borderColor[] = { 1.0, 1.0, 1.0, 1.0 };
+glTexParameterfv(GL_TEXTURE_2D, GL_TEXTURE_BORDER_COLOR, borderColor);
+```
+
+![image-20250529211847004](https://cdn.jsdelivr.net/gh/Dagaz84521/DagazBlogPicture@main/img/20250529211847200.png)
+
+重复确实没有了。但这个黑白分界还是很明显。
+
+### 黑白分界
+
+这是因为那里的坐标超出了光的正交视锥的远平面。你可以看到这片黑色区域总是出现在光源视锥的极远处。
+
+当一个点比光的远平面还要远时，它的投影坐标的z坐标大于1.0。这种情况下，GL_CLAMP_TO_BORDER环绕方式不起作用，因为我们把坐标的z元素和深度贴图的值进行了对比；它总是为大于1.0的z返回true。
+
+所以也很简单，z大于1.0的时候，我们直接返回0.0就行了：
+
+```glsl
+float ShadowCalculation(vec4 fragPosLightSpace, vec3 normal, vec3 lightDir)
+{
+	[...]
+    if(projCoords.z > 1.0)
+        shadow = 0.0;
+
+    return shadow;
+}
+```
+
+![image-20250529212307364](https://cdn.jsdelivr.net/gh/Dagaz84521/DagazBlogPicture@main/img/20250529212307561.png)
+
+这样大毛病就修复完了，接下来是小毛病了。
+
+### Peter Pan
+
+![image-20250529212427503](https://cdn.jsdelivr.net/gh/Dagaz84521/DagazBlogPicture@main/img/20250529212427692.png)
+
+可以看到这个位置，阴影稍微有点偏移。
+
+### PCF
+
+我们可以看到，我们现在的阴影还是棱角分明的。
+
+接下来要做的就是如何将这个阴影变得柔和。
+
+## 使用模型
+
+这里一开始犯了一个很严重的错误，我将模型的加载放到了渲染循环里，导致了每次渲染都需要加载模型，fps直接下降到0.36.太bt了。
+
+还有一个可以进行优化的地方，应该可以通过实例化。
+
+一点一点来吧，我们先来看看将model放到全局的一个效果。
