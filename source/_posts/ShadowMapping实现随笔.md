@@ -5,6 +5,7 @@ tags: [OpenGL, ShadowMapping, 帧缓冲, 立方体贴图]
 categories: 
 - [计算机图形学, 图形学实践]
 description: 根据LearnOpenGL还有浅墨翻译的RTR4实现的ShadowMapping
+cover: https://cdn.jsdelivr.net/gh/Dagaz84521/DagazBlogPicture@main/img/20250606141316291.png
 ---
 
 # ShadowMapping
@@ -523,7 +524,304 @@ glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
 
 在正常情况下，需要立方体贴图纹理的一个面附加到帧缓冲对象上，渲染场景6次，每次将帧缓冲的深度缓冲目标改成不同立方体贴图面。但是通过几何着色器，我们就可以实现所有面在一个过程渲染。所以可以直接绑定这个立方体贴图`depthCubeMap`到我们的`depthMapFBO`帧缓冲上。
 
+## 光空间的变换
 
+与阴影映射教程类似，我们将需要一个光空间的变换矩阵T，但是这次是每个面都有一个。
+
+对于一个面的P矩阵来说，还是很简单的：
+
+```C++
+float aspect = (GLfloat)SHADOW_WIDTH/(GLfloat)SHADOW_HEIGHT;
+float near = 1.0f;
+float far = 25.0f;
+glm::mat4 shadowProj = glm::perspective(glm::radians(90.0f), aspect, near, far);
+```
+
+根据前面的分析，这里点光源需要用的是一个透视投影矩阵。
+
+但是观察矩阵V就比较头疼了，因为每次看的都是不同方向的面，所以我们一共需要6个V矩阵。而且我们还需要按照右、左、上、下、近、远的顺序传入这个矩阵（因为我要在几何着色器完成六个面的深度绘制）：
+
+```C++
+std::vector<glm::mat4> shadowTransforms;
+shadowTransforms.push_back(shadowProj * 
+                 glm::lookAt(lightPos, lightPos + glm::vec3(1.0,0.0,0.0), glm::vec3(0.0,-1.0,0.0)));
+shadowTransforms.push_back(shadowProj * 
+                 glm::lookAt(lightPos, lightPos + glm::vec3(-1.0,0.0,0.0), glm::vec3(0.0,-1.0,0.0)));
+shadowTransforms.push_back(shadowProj * 
+                 glm::lookAt(lightPos, lightPos + glm::vec3(0.0,1.0,0.0), glm::vec3(0.0,0.0,1.0)));
+shadowTransforms.push_back(shadowProj * 
+                 glm::lookAt(lightPos, lightPos + glm::vec3(0.0,-1.0,0.0), glm::vec3(0.0,0.0,-1.0)));
+shadowTransforms.push_back(shadowProj * 
+                 glm::lookAt(lightPos, lightPos + glm::vec3(0.0,0.0,1.0), glm::vec3(0.0,-1.0,0.0)));
+shadowTransforms.push_back(shadowProj * 
+                 glm::lookAt(lightPos, lightPos + glm::vec3(0.0,0.0,-1.0), glm::vec3(0.0,-1.0,0.0)));
+```
+
+但是这六个矩阵不是那么容易理解。
+
+![缩略图](https://uploads.disquscdn.com/images/317909012d5718e941aab3aad496bbc5673be4f377327a20b3b9cae2db5fc943.png?w=800&h=367)
+
+这张图是从[立方体贴图纹理 - OpenGL Wiki](https://www.khronos.org/opengl/wiki/Cubemap_Texture)获取的，蓝色的表示这个纹理面的上方向，也就是`lookAt`中最后一个变量的方向。（这是一种约定吗？不太懂，后序可以问一下。）
+
+## 阴影贴图着色器
+
+### 顶点着色器
+
+顶点着色器做的工作比较简单：
+
+```glsl
+#version 330 core
+layout (location = 0) in vec3 aPos;
+
+uniform mat4 model;
+
+void main()
+{
+    gl_Position = model * vec4(aPos, 1.0);
+}
+```
+
+### 几何着色器
+
+几何着色器就是将我们从前面获取到的三角形，向六个面都做一个MVP变化：
+
+```glsl
+#version 330 core
+layout (triangles) in;
+layout (triangle_strip, max_vertices=18) out;
+
+uniform mat4 shadowMatrices[6];
+
+out vec4 FragPos; 
+
+void main()
+{
+    for(int face = 0; face < 6; ++face)
+    {
+        gl_Layer = face; 
+        for(int i = 0; i < 3; ++i) 
+        {
+            FragPos = gl_in[i].gl_Position;
+            gl_Position = shadowMatrices[face] * FragPos;
+            EmitVertex();
+        }    
+        EndPrimitive();
+    }
+} 
+```
+
+其中gl_Layer是一个内建变量，它指定发散出基本图形送到立方体贴图的哪个面。
+
+### 片段着色器
+
+片段着色器所做的就是将深度信息保存下来：
+
+```glsl
+#version 330 core
+in vec4 FragPos;
+
+uniform vec3 lightPos;
+uniform float far_plane;
+
+void main()
+{
+    float lightDistance = length(FragPos.xyz - lightPos);
+    
+    lightDistance = lightDistance / far_plane;
+    
+    gl_FragDepth = lightDistance;
+}
+```
+
+这里要进行归一化的原因是我们使用的深度缓存，其范围是[0.0,1.0]的浮点数。
+
+以上，我们就能将场景的深度信息保存在一个立方体贴图中了。
+
+接下来就需要使用这个立方体贴图完成阴影的绘制了。
+
+## 渲染阴影
+
+其他的部分其实和定向光差别不大。但是由于我们采用的是一个立方体内部的场景，而我们一般设置的立方体其法线都是面的法线，是朝立方体外部的，所以需要在片段着色器的部分增加一个bool类型的变量`reverse_normals`，来告诉我们渲染的立方体内部还是外部：
+
+### 顶点着色器
+
+```glsl
+#version 330 core
+layout (location = 0) in vec3 aPos;
+layout (location = 1) in vec3 aNormal;
+layout (location = 2) in vec2 aTexCoords;
+
+out vec2 TexCoords;
+
+out VS_OUT {
+    vec3 FragPos;
+    vec3 Normal;
+    vec2 TexCoords;
+} vs_out;
+
+uniform mat4 projection;
+uniform mat4 view;
+uniform mat4 model;
+
+uniform bool reverse_normals;
+
+void main()
+{
+    vs_out.FragPos = vec3(model * vec4(aPos, 1.0));
+    if(reverse_normals) 
+        vs_out.Normal = transpose(inverse(mat3(model))) * (-1.0 * aNormal);
+    else
+        vs_out.Normal = transpose(inverse(mat3(model))) * aNormal;
+    vs_out.TexCoords = aTexCoords;
+    gl_Position = projection * view * model * vec4(aPos, 1.0);
+}
+```
+
+### 片段着色器
+
+```C++
+#version 330 core
+out vec4 FragColor;
+
+in VS_OUT {
+    vec3 FragPos;
+    vec3 Normal;
+    vec2 TexCoords;
+} fs_in;
+
+uniform sampler2D diffuseTexture;
+uniform samplerCube depthMap;
+
+uniform vec3 lightPos;
+uniform vec3 viewPos;
+
+uniform float far_plane;
+uniform bool shadows;
+
+float ShadowCalculation(vec3 fragPos)
+{
+    // 片段和光源向量
+    vec3 fragToLight = fragPos - lightPos;
+    // 利用fragToLight可以从立方体贴图中获取深度信息
+    float closestDepth = texture(depthMap, fragToLight).r;
+    // 将深度信息还原
+    closestDepth *= far_plane;
+    // 片段到光源的距离
+    float currentDepth = length(fragToLight);
+    
+    float bias = 0.05; 
+    float shadow = currentDepth -  bias > closestDepth ? 1.0 : 0.0;
+
+    return shadow;
+}
+
+void main()
+{           
+    vec3 color = texture(diffuseTexture, fs_in.TexCoords).rgb;
+    vec3 normal = normalize(fs_in.Normal);
+    vec3 lightColor = vec3(0.3);
+    // ambient
+    vec3 ambient = 0.3 * lightColor;
+    // diffuse
+    vec3 lightDir = normalize(lightPos - fs_in.FragPos);
+    float diff = max(dot(lightDir, normal), 0.0);
+    vec3 diffuse = diff * lightColor;
+    // specular
+    vec3 viewDir = normalize(viewPos - fs_in.FragPos);
+    vec3 reflectDir = reflect(-lightDir, normal);
+    float spec = 0.0;
+    vec3 halfwayDir = normalize(lightDir + viewDir);  
+    spec = pow(max(dot(normal, halfwayDir), 0.0), 64.0);
+    vec3 specular = spec * lightColor;    
+    // calculate shadow
+    float shadow = shadows ? ShadowCalculation(fs_in.FragPos) : 0.0;                      
+    vec3 lighting = (ambient + (1.0 - shadow) * (diffuse + specular)) * color;    
+    
+    FragColor = vec4(lighting, 1.0);
+}
+```
+
+### 渲染循环
+
+```C++
+while(!glfwWindowShouldClose(window))
+{
+    // per-frame time logic
+    float currentFrame = glfwGetTime();
+    deltaTime = currentFrame - lastFrame;
+    lastFrame = currentFrame;
+
+    // input
+    processInput(window);
+    lightPos.z = static_cast<float>(sin(glfwGetTime() * 0.5) * 3.0);
+
+    glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+    // 光源空间矩阵
+    float near_plane = 1.0f, far_plane = 25.0f;
+    glm::mat4 shadowProj = glm::perspective(glm::radians(90.0f), (float)SHADOW_WIDTH / (float)SHADOW_HEIGHT, near_plane, far_plane);
+    std::vector<glm::mat4> shadowTransforms;
+    shadowTransforms.push_back(shadowProj * glm::lookAt(lightPos, lightPos + glm::vec3( 1.0f,  0.0f,  0.0f), glm::vec3(0.0f, -1.0f,  0.0f)));
+    shadowTransforms.push_back(shadowProj * glm::lookAt(lightPos, lightPos + glm::vec3(-1.0f,  0.0f,  0.0f), glm::vec3(0.0f, -1.0f,  0.0f)));
+    shadowTransforms.push_back(shadowProj * glm::lookAt(lightPos, lightPos + glm::vec3( 0.0f,  1.0f,  0.0f), glm::vec3(0.0f,  0.0f,  1.0f)));
+    shadowTransforms.push_back(shadowProj * glm::lookAt(lightPos, lightPos + glm::vec3( 0.0f, -1.0f,  0.0f), glm::vec3(0.0f,  0.0f, -1.0f)));
+    shadowTransforms.push_back(shadowProj * glm::lookAt(lightPos, lightPos + glm::vec3( 0.0f,  0.0f,  1.0f), glm::vec3(0.0f, -1.0f,  0.0f)));
+    shadowTransforms.push_back(shadowProj * glm::lookAt(lightPos, lightPos + glm::vec3( 0.0f,  0.0f, -1.0f), glm::vec3(0.0f, -1.0f,  0.0f)));
+    // 渲染阴影贴图
+    glViewport(0, 0, SHADOW_WIDTH, SHADOW_HEIGHT);
+    glBindFramebuffer(GL_FRAMEBUFFER, depthMapFBO);
+        glClear(GL_DEPTH_BUFFER_BIT);
+        simpleDepth.use();
+        for (unsigned int i = 0; i < 6; ++i)
+            simpleDepth.setMat4("shadowMatrices[" + std::to_string(i) + "]", shadowTransforms[i]);
+        simpleDepth.setFloat("far_plane", far_plane);
+        simpleDepth.setVec3("lightPos", lightPos);
+        renderScene(simpleDepth);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, SCR_WIDTH, SCR_HEIGHT);
+    glViewport(0, 0, SCR_WIDTH, SCR_HEIGHT);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    pointShadow.use();
+    glm::mat4 projection = glm::perspective(glm::radians(camera.Zoom), (float)SCR_WIDTH / (float)SCR_HEIGHT, 0.1f, 100.0f);
+    glm::mat4 view = camera.GetViewMatrix();
+    pointShadow.setMat4("projection", projection);
+    pointShadow.setMat4("view", view);
+    // set lighting uniforms
+    pointShadow.setVec3("lightPos", lightPos);
+    pointShadow.setVec3("viewPos", camera.Position);
+    pointShadow.setInt("shadows", shadows); // enable/disable shadows by pressing 'SPACE'
+    pointShadow.setFloat("far_plane", far_plane);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, woodTexture);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_CUBE_MAP, depthCubeMap);
+    renderScene(pointShadow);
+    // draw light source
+    LightCube.use();
+    glm::mat4 model = glm::mat4(1.0f);
+    model = glm::translate(model, lightPos);
+    model = glm::scale(model, glm::vec3(0.2f)); // a smaller cube
+    LightCube.setMat4("model", model);
+    LightCube.setMat4("projection", projection);
+    LightCube.setMat4("view", view);
+    glBindTexture(GL_TEXTURE_CUBE_MAP, depthCubeMap);
+    renderCube();
+
+
+    glfwSwapBuffers(window);
+    glfwPollEvents();
+}
+```
+
+其中LightCube是为了能更直观地显示光源位置：
+
+![image-20250605135255467](https://cdn.jsdelivr.net/gh/Dagaz84521/DagazBlogPicture@main/img/image-20250605135255467.png)
+
+然后还可以像定向光一样，使用PCF优化。但是我觉得后面应该会使用不少优化技巧，所以先浅尝辄止吧。
 
 # 附录
+
+## 代码
 
