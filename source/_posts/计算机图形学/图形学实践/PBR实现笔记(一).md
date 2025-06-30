@@ -8,7 +8,7 @@ description: 根据LearnOpenGL、RTR Edition 4和GAMES101实现的基于物理�
 ---
 
 # PBR
-
+ 
 PBR(Physical-Based Rendering， 基于物理的渲染)指的是一些在不同程度上都基于与现实世界的物理原理更相符的基本理论所构成的渲染技术的集合。
 
 有两大好处：
@@ -297,7 +297,7 @@ vec3 fresnelSchlick(float cosTheta, vec3 F0)
 ## Cook-Torrance反射率方程
 
 $$
-L_o(p,\omega_o)=\int_\omega(\frac{DFG}{4(\omega_o·n)(\omega_i·n)})L_i(p,\omega_i)n·\omega_i \mathrm{d}\omega_i
+L_o(p,\omega_o)=\int_\Omega(\frac{DFG}{4(\omega_o·n)(\omega_i·n)})L_i(p,\omega_i)n·\omega_i \mathrm{d}\omega_i
 $$
 
 

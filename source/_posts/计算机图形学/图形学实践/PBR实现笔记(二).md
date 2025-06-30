@@ -1,13 +1,14 @@
 ---
 title: PBR实现笔记(二)
 date: 2025-06-07 22:38:15
-tags: [OpenGL, PBR]
-categories: 
-- [计算机图形学, 图形学实践]
+tags:
+  - OpenGL
+  - PBR
+categories:
+  - - 计算机图形学
+    - 图形学实践
 cover: https://cdn.jsdelivr.net/gh/Dagaz84521/DagazBlogPicture@main/img/image-20250607235533437.png
 ---
-
-# 
 
 # 回顾
 
